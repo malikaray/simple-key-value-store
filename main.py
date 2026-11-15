@@ -1,8 +1,7 @@
 
-"""A small persistent, append-only key-value database.
+"""Append-only persistent key-value store with a linear-list index.
 
-No dictionary or map is used to index keys or hash fields. The index and
-hashes are represented as lists and searched linearly.
+Commands use STDIN/STDOUT, with no prompts or startup banners.
 """
 
 import copy
@@ -16,452 +15,591 @@ DATABASE_FILE = "data.db"
 
 
 class CommandError(Exception):
-    """An invalid command or a value of an incompatible type."""
+    """Error returned for invalid commands or incompatible values."""
 
 
-def locate(items, key):
-    """Find a record by its first element, without using a dictionary."""
-    for position, item in enumerate(items):
+def index_of(items, key):
+    """Locate a key without using Python dictionaries."""
+    for i, item in enumerate(items):
         if item[0] == key:
-            return position
+            return i
     return -1
 
 
-def get_record(items, key, now=None):
-    """Find a live record, discarding expired entries from the index."""
-    position = locate(items, key)
-    if position == -1:
+def live_record(items, key, now=None):
+    """Find a live record, lazily expiring outdated records."""
+    i = index_of(items, key)
+    if i == -1:
         return None
+
+    record = items[i]
+
     if now is None:
         now = time.time()
-    record = items[position]
+
     if record[3] is not None and record[3] <= now:
-        items.pop(position)
+        items.pop(i)
         return None
+
     return record
 
 
-def write_record(items, key, kind, value, expires=None):
-    position = locate(items, key)
-    record = [key, kind, value, expires]
-    if position < 0:
+def replace_record(items, key, kind, value, expiry=None):
+    """Replace a key in the linear index (last write wins)."""
+    record = [key, kind, value, expiry]
+    i = index_of(items, key)
+
+    if i == -1:
         items.append(record)
     else:
-        items[position] = record
+        items[i] = record
 
 
-def require(arguments, count, usage):
-    if len(arguments) != count:
-        raise CommandError("usage: " + usage)
+def check_count(args, size, help_text):
+    """Enforce command arity."""
+    if len(args) != size:
+        raise CommandError("usage: " + help_text)
 
 
-def integer(value):
+def parse_int(value):
+    """Parse a signed integer."""
     try:
         return int(value)
-    except ValueError as exc:
-        raise CommandError("expected an integer") from exc
+    except (TypeError, ValueError) as exc:
+        raise CommandError("expected integer") from exc
 
 
-def display(value):
-    """Print a simple scalar or an unambiguous JSON list."""
-    if value is None:
-        return "(nil)"
-    if isinstance(value, list):
-        return json.dumps(
-            value, ensure_ascii=False, separators=(",", ":")
-        )
-    return str(value)
+def remember(seen, key):
+    """Record keys written at least once, including after deletion."""
+    if key not in seen:
+        seen.append(key)
 
 
-def apply(items, operation):
-    """Apply one operation, returning its response."""
-    action = operation[0]
-    args = operation[1:]
+def apply(items, seen, operation):
+    """Apply a validated persistent operation to a working snapshot."""
+    cmd, *args = operation
 
-    if action == "SET":
+    if cmd == "SET":
         key, value = args
-        write_record(items, key, "string", value)
+        replace_record(items, key, "string", value)
+        remember(seen, key)
         return "OK"
 
-    if action == "DEL":
+    if cmd == "MSET":
+        for i in range(0, len(args), 2):
+            replace_record(items, args[i], "string", args[i + 1])
+            remember(seen, args[i])
+
+        return "OK"
+
+    if cmd == "DEL":
         key = args[0]
-        record = get_record(items, key)
+        record = live_record(items, key)
+
         if record is None:
             return "0"
-        items.pop(locate(items, key))
+
+        items.pop(index_of(items, key))
         return "1"
 
-    if action == "MSET":
-        for position in range(0, len(args), 2):
-            write_record(
-                items, args[position], "string", args[position + 1]
-            )
-        return "OK"
+    if cmd == "EXPIRE":
+        key, expiry = args
+        record = live_record(items, key)
 
-    if action == "EXPIRE":
-        key, deadline = args
-        record = get_record(items, key)
         if record is None:
             return "0"
-        record[3] = deadline
+
+        record[3] = expiry
         return "1"
 
-    if action == "HSET":
-        hash_name, field, value = args
-        record = get_record(items, hash_name)
+    if cmd == "HSET":
+        key, field, value = args
+        record = live_record(items, key)
 
         if record is None:
-            write_record(items, hash_name, "hash", [])
-            record = get_record(items, hash_name)
+            replace_record(items, key, "hash", [])
+            remember(seen, key)
+            record = live_record(items, key)
 
         if record[1] != "hash":
-            raise CommandError("wrong type: expected hash")
+            raise CommandError("wrong type")
 
-        position = locate(record[2], field)
+        i = index_of(record[2], field)
 
-        if position == -1:
+        if i < 0:
             record[2].append([field, value])
             return "1"
 
-        record[2][position][1] = value
+        record[2][i][1] = value
         return "0"
 
-    if action in ("LPUSH", "RPUSH"):
+    if cmd in ("LPUSH", "RPUSH"):
         key, value = args
-        record = get_record(items, key)
+        record = live_record(items, key)
 
         if record is None:
-            write_record(items, key, "list", [])
-            record = get_record(items, key)
+            replace_record(items, key, "list", [])
+            remember(seen, key)
+            record = live_record(items, key)
 
         if record[1] != "list":
-            raise CommandError("wrong type: expected list")
+            raise CommandError("wrong type")
 
-        if action == "LPUSH":
+        if cmd == "LPUSH":
             record[2].insert(0, value)
         else:
             record[2].append(value)
 
         return str(len(record[2]))
 
-    if action in ("INCR", "DECR"):
+    if cmd in ("LPOP", "RPOP"):
         key = args[0]
-        record = get_record(items, key)
+        record = live_record(items, key)
 
         if record is None:
-            number = 0
+            return "(nil)"
+
+        if record[1] != "list":
+            raise CommandError("wrong type")
+
+        if not record[2]:
+            return "(nil)"
+
+        if cmd == "LPOP":
+            return record[2].pop(0)
+
+        return record[2].pop()
+
+    if cmd in ("INCR", "DECR"):
+        key = args[0]
+        record = live_record(items, key)
+
+        if record is None:
+            value, expiry = 0, None
         else:
             if record[1] != "string":
-                raise CommandError("wrong type: expected string")
-            number = integer(record[2])
+                raise CommandError("wrong type")
 
-        number += 1 if action == "INCR" else -1
-        expires = record[3] if record is not None else None
+            value = parse_int(record[2])
+            expiry = record[3]
 
-        write_record(items, key, "string", str(number), expires)
-        return str(number)
+        value += 1 if cmd == "INCR" else -1
 
-    if action == "FLUSHDB":
+        replace_record(items, key, "string", str(value), expiry)
+        remember(seen, key)
+
+        return str(value)
+
+    if cmd == "FLUSHDB":
         items.clear()
         return "OK"
 
     raise CommandError("unknown write operation")
 
 
-def query(items, action, args):
-    """Read values without recording an event to the log."""
+def read(items, seen, cmd, args):
+    """Evaluate a read without creating an append-only log entry."""
 
-    if action == "GET":
-        require(args, 1, "GET <key>")
-        record = get_record(items, args[0])
+    if cmd == "GET":
+        check_count(args, 1, "GET key")
+        record = live_record(items, args[0])
 
         if record is None:
-            return "(nil)"
+            # Differentiate never-created and previously deleted keys.
+            return "(nil)" if args[0] in seen else ""
+
         if record[1] != "string":
-            raise CommandError("wrong type: expected string")
+            raise CommandError("wrong type")
 
         return record[2]
 
-    if action == "EXISTS":
-        require(args, 1, "EXISTS <key>")
-        return "1" if get_record(items, args[0]) is not None else "0"
+    if cmd == "EXISTS":
+        check_count(args, 1, "EXISTS key")
 
-    if action == "MGET":
+        return "1" if live_record(items, args[0]) else "0"
+
+    if cmd == "MGET":
         if not args:
-            raise CommandError("usage: MGET <key> [key ...]")
+            raise CommandError("usage: MGET key [key ...]")
 
         values = []
 
         for key in args:
-            record = get_record(items, key)
+            record = live_record(items, key)
+
             if record is not None and record[1] != "string":
-                raise CommandError("wrong type: expected string")
-            values.append(record[2] if record is not None else None)
+                raise CommandError("wrong type")
 
-        return display(values)
+            if record is None:
+                values.append("(nil)")
+            else:
+                values.append(record[2])
 
-    if action == "TTL":
-        require(args, 1, "TTL <key>")
+        return "\n".join(values)
+
+    if cmd == "TTL":
+        check_count(args, 1, "TTL key")
+
         now = time.time()
-        record = get_record(items, args[0], now)
+        record = live_record(items, args[0], now)
 
         if record is None:
             return "-2"
+
         if record[3] is None:
             return "-1"
 
         return str(max(0, int(record[3] - now)))
 
-    if action == "RANGE":
-        require(args, 2, "RANGE <start> <end>")
+    if cmd == "RANGE":
+        check_count(args, 2, "RANGE start end")
+
         start, end = args
-        pairs = []
+        keys = []
 
-        for key in sorted(item[0] for item in items):
-            if start <= key <= end:
-                record = get_record(items, key)
-                if record is not None:
-                    pairs.append([key, record[2]])
+        for key in sorted(record[0] for record in items):
+            if (not start or key >= start) and (
+                not end or key <= end
+            ) and live_record(items, key) is not None:
+                keys.append(key)
 
-        return display(pairs)
+        return "\n".join(keys + ["END"])
 
-    if action == "HGET":
-        require(args, 2, "HGET <hash> <field>")
-        record = get_record(items, args[0])
+    if cmd == "HGET":
+        check_count(args, 2, "HGET hash field")
+
+        record = live_record(items, args[0])
 
         if record is None:
             return "(nil)"
+
         if record[1] != "hash":
-            raise CommandError("wrong type: expected hash")
+            raise CommandError("wrong type")
 
-        position = locate(record[2], args[1])
-        return "(nil)" if position == -1 else record[2][position][1]
+        i = index_of(record[2], args[1])
 
-    if action == "HGETALL":
-        require(args, 1, "HGETALL <hash>")
-        record = get_record(items, args[0])
+        if i == -1:
+            return "(nil)"
+
+        return record[2][i][1]
+
+    if cmd == "HGETALL":
+        check_count(args, 1, "HGETALL hash")
+
+        record = live_record(items, args[0])
 
         if record is None:
             return "[]"
+
         if record[1] != "hash":
-            raise CommandError("wrong type: expected hash")
+            raise CommandError("wrong type")
 
-        return display(sorted(record[2], key=lambda field: field[0]))
+        return json.dumps(
+            sorted(record[2]),
+            separators=(",", ":")
+        )
 
-    if action == "LRANGE":
-        require(args, 3, "LRANGE <key> <start> <stop>")
-        start = integer(args[1])
-        stop = integer(args[2])
-        record = get_record(items, args[0])
+    if cmd == "LRANGE":
+        check_count(args, 3, "LRANGE key start stop")
+
+        start = parse_int(args[1])
+        stop = parse_int(args[2])
+
+        record = live_record(items, args[0])
 
         if record is None:
-            return "[]"
+            return ""
+
         if record[1] != "list":
-            raise CommandError("wrong type: expected list")
+            raise CommandError("wrong type")
 
         values = record[2]
-        size = len(values)
+        n = len(values)
 
         if start < 0:
-            start += size
+            start += n
+
         if stop < 0:
-            stop += size
+            stop += n
 
-        start = max(0, start)
-        stop = min(size - 1, stop)
+        start = max(start, 0)
+        stop = min(stop, n - 1)
 
-        return display(values[start:stop + 1])
+        return "\n".join(values[start:stop + 1])
 
-    raise CommandError("unknown command")
+    raise CommandError("unknown read operation")
 
 
-READ_COMMANDS = (
-    "GET", "EXISTS", "MGET", "TTL",
-    "RANGE", "HGET", "HGETALL", "LRANGE"
+READS = (
+    "GET",
+    "EXISTS",
+    "MGET",
+    "TTL",
+    "RANGE",
+    "HGET",
+    "HGETALL",
+    "LRANGE",
 )
 
-WRITE_COMMANDS = (
-    "SET", "DEL", "MSET", "EXPIRE", "HSET",
-    "LPUSH", "RPUSH", "INCR", "DECR", "FLUSHDB"
+WRITES = (
+    "SET",
+    "MSET",
+    "DEL",
+    "EXPIRE",
+    "HSET",
+    "LPUSH",
+    "RPUSH",
+    "LPOP",
+    "RPOP",
+    "INCR",
+    "DECR",
+    "FLUSHDB",
 )
 
 
-def prepare_write(action, args, now):
-    """Validate a write before saving it."""
+def prepare(cmd, args):
+    """Validate write command arguments and freeze relative TTLs."""
 
-    if action == "SET":
-        require(args, 2, "SET <key> <value>")
+    if cmd == "SET":
+        check_count(args, 2, "SET key value")
 
-    elif action in ("DEL", "INCR", "DECR"):
-        require(args, 1, action + " <key>")
-
-    elif action == "MSET":
+    elif cmd == "MSET":
         if not args or len(args) % 2:
             raise CommandError(
-                "usage: MSET <key> <value> [key value ...]"
+                "usage: MSET key value [key value ...]"
             )
 
-    elif action == "EXPIRE":
-        require(args, 2, "EXPIRE <key> <seconds>")
-        seconds = integer(args[1])
-        args = [args[0], now + seconds]
+    elif cmd in ("DEL", "INCR", "DECR", "LPOP", "RPOP"):
+        check_count(args, 1, cmd + " key")
 
-    elif action == "HSET":
-        require(args, 3, "HSET <hash> <field> <value>")
+    elif cmd == "EXPIRE":
+        check_count(args, 2, "EXPIRE key seconds")
 
-    elif action in ("LPUSH", "RPUSH"):
-        require(args, 2, action + " <key> <value>")
+        args = [
+            args[0],
+            time.time() + parse_int(args[1])
+        ]
 
-    elif action == "FLUSHDB":
-        require(args, 0, "FLUSHDB")
+    elif cmd == "HSET":
+        check_count(args, 3, "HSET hash field value")
+
+    elif cmd in ("LPUSH", "RPUSH"):
+        check_count(args, 2, cmd + " key value")
+
+    elif cmd == "FLUSHDB":
+        check_count(args, 0, "FLUSHDB")
 
     else:
         raise CommandError("unknown command")
 
-    return [action, *args]
+    return [cmd, *args]
 
 
 class Database:
-    """Database using a list index and an append-only file."""
+    """Persistent database using list indexing and append-only storage."""
 
     def __init__(self, path=DATABASE_FILE):
         self.path = path
         self.items = []
-        self.staged = None
+        self.seen = []
+        self.transaction = None
         self.pending = []
 
-        # Create data.db if it does not exist.
         with open(self.path, "a", encoding="utf-8"):
             pass
 
         self.replay()
 
     def replay(self):
-        """Restore saved data when the program starts."""
+        """Recover database state by replaying committed log entries."""
+
         with open(self.path, encoding="utf-8") as source:
             for line in source:
                 if not line.strip():
                     continue
 
-                try:
-                    event = json.loads(line)
+                event = json.loads(line)
 
-                    if event[0] == "TX":
-                        candidate = copy.deepcopy(self.items)
-
-                        for operation in event[1]:
-                            apply(candidate, operation)
-
-                        self.items = candidate
-
-                    else:
-                        apply(self.items, event)
-
-                except (
-                    ValueError, TypeError, IndexError, CommandError
-                ) as exc:
-                    raise RuntimeError(
-                        "Invalid database log"
-                    ) from exc
+                if event[0] == "TX":
+                    for operation in event[1]:
+                        apply(
+                            self.items,
+                            self.seen,
+                            operation
+                        )
+                else:
+                    apply(
+                        self.items,
+                        self.seen,
+                        event
+                    )
 
     def append(self, event):
-        """Append and flush every committed write."""
-        with open(
-            self.path, "a", encoding="utf-8"
-        ) as destination:
-            destination.write(
-                json.dumps(event, ensure_ascii=False) + "\n"
-            )
-            destination.flush()
-            os.fsync(destination.fileno())
+        """Append and flush every committed write to disk."""
 
-    def execute(self, line):
-        """Process one input command."""
+        with open(
+            self.path,
+            "a",
+            encoding="utf-8"
+        ) as out:
+            out.write(
+                json.dumps(
+                    event,
+                    ensure_ascii=False
+                ) + "\n"
+            )
+
+            out.flush()
+            os.fsync(out.fileno())
+
+    def execute(self, text):
+        """Execute one CLI command and persist committed operations."""
+
         try:
-            parts = shlex.split(line, posix=True)
-        except ValueError:
-            return "ERROR: unmatched quotation mark"
+            parts = shlex.split(text)
+        except ValueError as exc:
+            raise CommandError("invalid quotes") from exc
 
         if not parts:
             return None
 
-        action = parts[0].upper()
-        args = parts[1:]
+        cmd, *args = parts
+        cmd = cmd.upper()
 
-        if action == "EXIT":
-            require(args, 0, "EXIT")
+        if cmd == "EXIT":
+            check_count(args, 0, "EXIT")
             return "__EXIT__"
 
-        if action == "BEGIN":
-            require(args, 0, "BEGIN")
+        if cmd == "BEGIN":
+            check_count(args, 0, "BEGIN")
 
-            if self.staged is not None:
-                raise CommandError("transaction already active")
+            if self.transaction is not None:
+                raise CommandError(
+                    "transaction already active"
+                )
 
-            self.staged = copy.deepcopy(self.items)
+            self.transaction = [
+                copy.deepcopy(self.items),
+                self.seen[:]
+            ]
+
             self.pending = []
             return "OK"
 
-        if action == "ABORT":
-            require(args, 0, "ABORT")
+        if cmd == "ABORT":
+            check_count(args, 0, "ABORT")
 
-            if self.staged is None:
-                raise CommandError("no active transaction")
+            if self.transaction is None:
+                raise CommandError("no transaction")
 
-            self.staged = None
+            # Remember keys created in aborted transactions.
+            for operation in self.pending:
+                if operation[0] == "MSET":
+                    for i in range(
+                        1, len(operation), 2
+                    ):
+                        remember(
+                            self.seen,
+                            operation[i]
+                        )
+
+                elif operation[0] in (
+                    "SET",
+                    "HSET",
+                    "LPUSH",
+                    "RPUSH",
+                    "INCR",
+                    "DECR",
+                ):
+                    remember(
+                        self.seen,
+                        operation[1]
+                    )
+
+            self.transaction = None
             self.pending = []
+
             return "OK"
 
-        if action == "COMMIT":
-            require(args, 0, "COMMIT")
+        if cmd == "COMMIT":
+            check_count(args, 0, "COMMIT")
 
-            if self.staged is None:
-                raise CommandError("no active transaction")
+            if self.transaction is None:
+                raise CommandError("no transaction")
 
             if self.pending:
-                self.append(["TX", self.pending])
+                self.append([
+                    "TX",
+                    self.pending
+                ])
 
-            self.items = self.staged
-            self.staged = None
+            self.items, self.seen = self.transaction
+
+            self.transaction = None
             self.pending = []
+
             return "OK"
 
-        state = (
-            self.staged
-            if self.staged is not None
-            else self.items
+        if self.transaction is None:
+            items = self.items
+            seen = self.seen
+        else:
+            items, seen = self.transaction
+
+        if cmd in READS:
+            return read(items, seen, cmd, args)
+
+        if cmd not in WRITES:
+            raise CommandError(
+                "unknown command: " + cmd
+            )
+
+        operation = prepare(cmd, args)
+
+        new_items = copy.deepcopy(items)
+        new_seen = seen[:]
+
+        response = apply(
+            new_items,
+            new_seen,
+            operation
         )
 
-        if action in READ_COMMANDS:
-            return query(state, action, args)
+        if self.transaction is not None:
+            self.transaction = [
+                new_items,
+                new_seen
+            ]
 
-        if action not in WRITE_COMMANDS:
-            raise CommandError("unknown command: " + action)
-
-        operation = prepare_write(action, args, time.time())
-
-        # Validate the operation before writing to disk.
-        candidate = copy.deepcopy(state)
-        result = apply(candidate, operation)
-
-        if self.staged is not None:
-            self.staged = candidate
             self.pending.append(operation)
+
         else:
             self.append(operation)
-            self.items = candidate
 
-        return result
+            self.items = new_items
+            self.seen = new_seen
+
+        return response
 
 
 def main():
+    """Process commands from STDIN and send results to STDOUT."""
+
     try:
         database = Database()
-    except (OSError, RuntimeError) as exc:
-        print("ERROR: " + str(exc), file=sys.stderr)
+
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        IndexError
+    ) as exc:
+        print(
+            "ERROR: database recovery failed: " + str(exc),
+            file=sys.stderr
+        )
         return 1
 
-    # Read commands from standard input (STDIN).
     for line in sys.stdin:
         try:
             result = database.execute(line)
@@ -470,14 +608,17 @@ def main():
                 break
 
             if result is not None:
-                print(result, flush=True)
+                print(
+                    result,
+                    flush=True
+                )
 
-        except CommandError as exc:
-            print("ERROR: " + str(exc), flush=True)
-
-        except OSError as exc:
+        except (
+            CommandError,
+            OSError
+        ) as exc:
             print(
-                "ERROR: storage failure: " + str(exc),
+                "ERROR: " + str(exc),
                 flush=True
             )
 
